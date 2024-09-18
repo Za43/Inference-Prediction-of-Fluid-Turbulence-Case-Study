@@ -1,0 +1,899 @@
+---
+title: "Inference & Prediction of Fluid Turbulence Case Study"
+author: "Khushmeet Chandi, Athena Ru, Jason Ren, Zaid Muqsit"
+date: "10/28/2023"
+geometry: "left=1.5cm,right=1.5cm,top=1.5cm,bottom=1.6cm"
+output: pdf_document
+header-includes: 
+  - \usepackage{titling}
+  - \setlength{\droptitle}{-0.7in}
+---
+
+## Introduction
+
+The primary focus revolves around unraveling the intricate dynamics of the distributions particle clusters in turbulence. The dataset, comprising 89 simulations, is characterized by three predictors: Reynolds number (Re), gravitational acceleration (Fr), and particle characteristic (St). The response variables are the four raw moments: the first raw moment ($E[X]$) is mean or average volume; the second raw moment ($E[X^2]$) is the variance; the third raw moment ($E[X^3]$) is the skewness; and the fourth raw moment ($E[X^4]$) is kurtosis which gives insights into the distribution's tail behavior.
+
+In terms of physical meaning, the greater the Reynolds number, the higher the particle tracking resolution. If gravitational acceleration increases, particles may fall faster and cover a larger spatial area within the given domain. Notably, cumulonimbus (high-level clouds) correspond to `Fr = 0.3` or `Inf` and cumulus (low-level clouds) correspond to `Fr = 0.052`. Lastly, the greater the particle property, the more difficult it is to solve for the particle's equation.
+
+The research objectives are inference and prediction. Through statistical methods such as cross validation and regression, our models achieve these objectives by interpreting the influence of individual parameters (Re, Fr, St) on the probability distribution of particle cluster volumes and by predicting the particle cluster volume distribution for novel parameter settings (Re, Fr, St). Ultimately, we gain a deeper comprehension of the underlying mechanisms governing particle cluster formation in diverse environmental conditions.
+
+## Cleaning & EDA:
+
+```{r load-data-and-pckgs, message = F, warning = F, echo=FALSE}
+
+library(ggplot2)
+library(tidyverse)
+library(glmnet)
+library(tidymodels)
+library(gtable)
+library(grid)
+library(gridExtra)
+library(latex2exp)
+library(cvms)
+library(groupdata2) # fold() partition()
+library(gplots)
+library(reshape2)
+library(knitr)
+library(caret)
+library(ggpubr)
+
+moments <- read.csv("data-train.csv")
+moments_test <- read.csv("data-test.csv")
+```
+
+```{r eda-response, fig.height = 1.5, echo=FALSE}
+log_X1_plot <- ggplot(moments, aes(x=log(R_moment_1))) +
+  geom_histogram(bins=8, fill = "skyblue") + 
+  labs(x=TeX(r'($log(E\[X\])$)'),
+       y="Count") +
+  theme_minimal() + 
+  ylim(c(0, 40)) + 
+  theme(plot.title = element_text(size = 7), 
+        axis.title.x = element_text(size = 6), 
+        axis.text.x = element_text(size = 6),
+        axis.title.y = element_text(size = 6), 
+        axis.text.y = element_text(size = 6))
+
+log_X2_plot <- ggplot(moments, aes(x=log(R_moment_2))) +
+  geom_histogram(bins=12, fill = "skyblue") + 
+  labs(x=TeX(r'($log(E\[X^2\])$)')) +
+  theme_minimal() + 
+  ylim(c(0, 40)) + 
+  theme(axis.title.x = element_text(size = 6), 
+        axis.text.x = element_text(size = 6),
+        axis.title.y=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank())
+
+log_X3_plot <- ggplot(moments, aes(x=log(R_moment_3))) +
+  geom_histogram(bins=12, fill = "skyblue") + 
+  labs(x=TeX(r'($log(E\[X^3\])$)')) +
+  theme_minimal() + 
+  ylim(c(0, 40)) + 
+  theme(axis.title.x = element_text(size = 6), 
+        axis.text.x = element_text(size = 6),
+        axis.title.y=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank())
+
+log_X4_plot <- ggplot(moments, aes(x=log(R_moment_4))) +
+  geom_histogram(bins=12, fill = "skyblue") + 
+  labs(x=TeX(r'($log(E\[X^4\])$)')) +
+  theme_minimal() + 
+  ylim(c(0, 40)) + 
+  theme(axis.title.x = element_text(size = 6), 
+        axis.text.x = element_text(size = 6),
+        axis.title.y=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank())
+
+par(mar = c(0, 2, 2, 2))
+
+grid.arrange(arrangeGrob(log_X1_plot, log_X2_plot, log_X3_plot, log_X4_plot,
+                         ncol = 4), 
+             top = "Histograms of Log Transformed Moments")
+```
+
+The distributions of the moments are all very right skewed. Turbulence data often tends to exhibit long tails and extreme values due to the chaotic nature of the phenomenon. Log transforming them yields a slightly more normal distribution - a necessary condition for our regression. This stabilizes variance and makes the data more conducive to statistical analysis and interpretation. Similarly, a log transformation was applied to `St` to make it more normal. A Box-cox transformation yielded similar results, but log transformation was chosen for easier interpretability. We also double checked for multicollinearity with a heatmap. The correlations between variables were relatively low. As such, we can go ahead and use all of these variables in our models.
+
+```{r eda-moment-all, fig.height=2.5, echo=FALSE}
+all_one_plot <- moments |>
+  #filter(Re != 90) |>
+  #filter(Re != 224) |>
+  ggplot(aes(x = log(St), y = log(R_moment_1), shape = factor(Fr), color = factor(Re))) +
+  geom_point(size = 1)+
+  labs(x = TeX(r'($log(St)$)'),
+       y = TeX(r'($log(E\[X\])$)'),
+       color = "Re",
+       shape = "Fr") +
+  theme_minimal() + 
+theme(axis.title.x = element_text(size = 6), 
+      axis.text.x = element_text(size = 6),
+      axis.title.y = element_text(size = 6), 
+      axis.text.y = element_text(size = 6),
+      legend.position = "none")
+
+all_two_plot <- moments |> 
+  ggplot(aes(x = log(St), 
+             y = log(R_moment_2), 
+             color = factor(Re),
+             shape = factor(Fr))) + 
+  geom_point(size=1) + 
+  labs(x = TeX(r'($log(St)$)'),
+       y = TeX(r'($log(E\[X^2\])$)'),
+       color = "Re",
+       shape = "Fr") +
+  theme_minimal() + 
+  theme(axis.title.x = element_text(size = 6), 
+        axis.text.x = element_text(size = 6),
+        axis.title.y = element_text(size = 6), 
+        axis.text.y = element_text(size = 6),
+        legend.position = "none",)
+
+all_three_plot <- moments |> 
+  ggplot(aes(x = log(St), 
+             y = log(R_moment_3), 
+             color = factor(Re),
+             shape = factor(Fr))) + 
+  geom_point(size=1) + 
+  labs(x = TeX(r'($log(St)$)'),
+       y = TeX(r'($log(E\[X^3\])$)'),
+       color = "Re",
+       shape = "Fr") +
+  theme_minimal() + 
+  theme(axis.title.x = element_text(size = 6), 
+        axis.text.x = element_text(size = 6),
+        axis.title.y = element_text(size = 6), 
+        axis.text.y = element_text(size = 6),
+        legend.position = "none")
+
+all_four_plot <- moments |> 
+  ggplot(aes(x = log(St), 
+             y = log(R_moment_4), 
+             color = factor(Re),
+             shape = factor(Fr))) + 
+  geom_point(size=1) + 
+  labs(x = TeX(r'($log(St)$)'),
+       y = TeX(r'($log(E\[X^4\])$)'),
+       color = "Re",
+       shape = "Fr") +
+  theme_minimal() + 
+  theme(axis.title.x = element_text(size = 6), 
+        axis.text.x = element_text(size = 6),
+        axis.title.y = element_text(size = 6), 
+        axis.text.y = element_text(size = 6),
+        legend.position = "none")
+
+plot_template <- moments |> 
+  ggplot(aes(x = log(St), 
+             y = log(R_moment_2), 
+             color = factor(Re),
+             shape = factor(Fr))) + 
+  geom_point(size=1) + 
+  theme_minimal() + 
+  theme(legend.position = "bottom")
+
+# grid.arrange(arrangeGrob(all_one_plot, all_two_plot,
+#                          all_three_plot, all_four_plot,
+#                          ncol = 4),
+#              top = "Log Transformed Moments vs. log(St)\nColored by Re, Shape by Fr")
+
+p <- ggarrange(all_one_plot, all_two_plot,
+                         all_three_plot, all_four_plot,
+                         ncol = 4, common.legend = TRUE, legend="bottom")
+
+annotate_figure(p, top = text_grob("Log Transformed Moments vs. log(St)\nColored by Re, Shape by Fr", size = 11))
+
+
+# gtable <- ggplot_gtable(ggplot_build(plot_template))
+# legend <- gtable_filter(gtable, "guide-box")
+# grid.draw(legend)
+```
+
+In the plots above, we see greater mixing between `St`, `Fr`, and `Re` as we go from the first moment to the fourth moment. **The plot of the log(First Moment)** shows clear distinctions amongst Re values, hinting at a particular relationship. Additionally, we can see a trend upwards as log(St) increases. There doesn't seem to be significance towards the Fr values from the plot, but there is a possible interaction between Fr and Re, as for certain values of Re, we see slightly different slopes when altering the Fr values (specifically for Infinity, the square, which increases more dramatically towards the seconds half of the graph). **The plot of log(Second Moment)** shows that the red circles are separated from the cluster. Thus, an indicator variable for when `Re` $\leq$ 100 and `Fr`=0.052 will be created. In general, as log(St) increases, so does log($E[X^2]$). A similar trend was found in **the log(Third Moment) plot**, where most data points followed a general pattern except for when `Re`=90 and `Fr`=0.052. As such, we consider interaction effects in our final model when predicting `log_R_moment_3`. **The fourth plot** shows the greatest overlap in points. The relationship between the log-transformed fourth moment and the predictors might not be entirely linear. There could be a threshold effect, meaning that the relationship changes differently for different ranges of the parameter values.
+
+```{r fouth-moment-narrative, echo=FALSE}
+# In the scatter plot above, the patterns of the log-transformed fourth moment against Reynolds number (Re), there are three vertical lines, suggesting that the relationship between these two variables might not be entirely linear. This indicates the presence of some underlying pattern that is not captured well by a simple linear relationship It's possible that the relationship between the log-transformed fourth moment and Re is characterized by a threshold effect, meaning that the relationship changes abruptly at specific Re values. This might indicate a particular point at which the behavior of the data significantly alters.
+# 
+# Similar to the previous scatter plot, in the scatter plot of the log-transformed fourth moment against Gravitational Acceleration (Fr), there are three vertical lines, suggesting that the relationship between these two variables might not be entirely linear. This indicates the presence of some underlying pattern that is not captured well by a simple linear transformation. It's possible that the relationship between the log-transformed fourth moment and Fr is characterized by a threshold effect, meaning that the relationship changes differently for different ranges of Fr values.
+# 
+#  This might suggest that the behavior of particle clustering in turbulence might be influenced by various particle sizes or types, each of which responds differently to the underlying fluid dynamics.
+# The fourth plot shows that there is likely not a linear relationship between the log-transformed fourth moment and St. Instead, there appears to be four logarithmic-looking lines, suggesting that there might be distinct groups or clusters within the St variable that exhibit logarithmic effects on the fourth moment.
+```
+
+```{r eda-moment-one-additional, fig.height = 2.2, ncol=3, echo=FALSE}
+
+moment_one <- moments |>
+  mutate(
+    Fr = case_when(
+      Fr == Inf ~ 10000,
+      TRUE ~ Fr
+    )
+  )
+# eda_m_1_3 <- ggplot(moments, aes(x=St, y = log(R_moment_1)))+
+#   geom_point(color = "skyblue", size=1) +
+#     labs(title="Log(First Raw Moment) vs. Stokes Number", 
+#        x=TeX(r'($St$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_1_4 <- ggplot(moments, aes(x=log(Re), y = log(R_moment_1)))+
+#   geom_point(color = "skyblue", size=1) +
+#     labs(title="Log(First Raw Moment) vs. Reynolds Number", 
+#        x=TeX(r'($Log(Re)$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_1_5 <- ggplot(moment_one, aes(x=log(Fr), y = log(R_moment_1)))+
+#   geom_point(color = "skyblue", size=1) +
+#     labs(title="Log(First Raw Moment) vs. Froude's Number", 
+#        x=TeX(r'($Log(Fr)$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_1_3 + eda_m_1_4 + eda_m_1_5 
+
+```
+
+```{r multicollinearity-check, fig.width = 4, fig.height = 3, echo=F}
+# creating temp df and replacing Fr inf with large value for heatmap purposes
+# moments_temp = moments
+# moments_temp$Fr = replace(moments_temp$Fr, is.infinite(moments_temp$Fr), 1000000)
+# 
+# correlation_matrix = cor(moments_temp[, c("St", "Re", "Fr")])
+# melted_cor <- melt(correlation_matrix)
+# ggplot(data = melted_cor, aes(x=Var1, y=Var2, fill=value)) +
+#   geom_tile()
+
+# heatmap.2(correlation_matrix)
+```
+
+```{r eda-moment-3, message = F, warning = F, echo=FALSE, fig.height = 4.5, ncol=2}
+moment_three = moments
+ 
+# log transform to unskew
+moment_three$log_St = log(moment_three$St)
+moment_three$log_R_moment_3 = log(moment_three$R_moment_3)
+# factorize
+moment_three$Fr_cat = factor(moment_three$Fr)
+moment_three$Re_cat = factor(moment_three$Re)
+# 
+# eda_m_3_1 <- moment_three |>
+#   ggplot(aes(x = log(R_moment_3)))+
+#   geom_histogram(fill='lightblue')+
+#   labs(title="Hist of log_R_moment_3", 
+#        x=TeX(r'($log(R Moment 3)$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_3_2 <- moment_three |>
+#   ggplot(aes(x = log(St)))+
+#   geom_histogram(fill='lightblue')+
+#   labs(title="Hist of log(St)", 
+#        x=TeX(r'($log(St)$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_3_3 <- moment_three |>
+#   ggplot(aes(x = Re_cat))+
+#   geom_bar(fill='lightblue')+
+#   labs(title="Hist of Re", 
+#        x=TeX(r'($Re$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_3_4 <- moment_three |>
+#   ggplot(aes(x = Fr_cat))+
+#   geom_bar(fill='lightblue')+
+#   labs(title="Hist of Fr", 
+#        x=TeX(r'($Fr$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# 
+# eda_m_3_1 + eda_m_3_2 + eda_m_3_3 + eda_m_3_4
+  
+
+# # plot distributions after transformations/factorization
+# par(mfrow = c(2, 2))
+# hist(log(moment_three$log_St), main = "Hist of log_St", xlab = "log_St", 
+#      ylab = "Frequency")
+# barplot(table(moment_three$Re_cat), main = "Hist of Re", 
+#         xlab = "Re", ylab = "Frequency")
+# barplot(table(moment_three$Fr_cat), main = "Hist of Fr", 
+#         xlab = "Fr", ylab = "Frequency")
+# hist(moment_three$log_R_moment_3, main = "Hist of log_R_moment_3", 
+#      xlab = "log_R_moment_3", ylab = "Frequency")
+# par(mfrow = c(1, 1))
+```
+
+```{r eda-moment-four-additional, message = F, warning = F, fig.height = 4.5, ncol=2, echo=FALSE}
+
+# eda_m_4_3 <- ggplot(moments, aes(x=St, y = (R_moment_4)))+
+#   geom_point(color = "red", size=1) +
+#     labs(title="Fourth Raw Moment vs. Stokes Number", 
+#        x=TeX(r'($St$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_4_4 <- ggplot(moments, aes(x=St, y = log(R_moment_4)))+
+#   geom_point(color = "red", size=1) +
+#     labs(title="Log(Fourth Raw Moment) vs. Stokes Number", 
+#        x=TeX(r'($St$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_4_5 <- ggplot(moments, aes(x=Re, y = log(R_moment_4)))+
+#   geom_point(color = "blue", size=1) +
+#     labs(title="Log(Fourth Raw Moment) vs. Reynolds Number", 
+#        x=TeX(r'($Log(Re)$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_4_6 <- ggplot(moments, aes(x=Fr, y = log(R_moment_4)))+
+#   geom_point(color = "green", size=1) +
+#     labs(title="Log(Fourth Raw Moment) vs. Froude's Number", 
+#        x=TeX(r'($Fr$)')) +
+#   theme(plot.title = element_text(size = 7), 
+#         axis.title.x = element_text(size = 6), 
+#         axis.text.x = element_text(size = 6),
+#         axis.title.y = element_text(size = 6), 
+#         axis.text.y = element_text(size = 6))
+# 
+# eda_m_4_3 + eda_m_4_4 + eda_m_4_5 + eda_m_4_6
+
+
+# Scatter plot of log-transformed fourth moment against Reynolds number (Re)
+# plot(log(moments$R_moment_4) ~ moments$Re, 
+#      main = "Log-Transformed Fourth Moment vs. Reynolds Number",
+#      xlab = "Reynolds Number",
+#      ylab = "Log-Transformed Fourth Moment",
+#      col = "blue")
+# # Scatter plot of log-transformed fourth moment against Gravitational Acceleration (Fr)
+# plot(log(moments$R_moment_4) ~ moments$Fr, 
+#      main = "Log-Transformed Fourth Moment vs. Gravitational Acceleration",
+#      xlab = "Gravitational Acceleration",
+#      ylab = "Log-Transformed Fourth Moment",
+#      col = "green")
+# 
+# # Scatter plot of fourth moment against particle characteristic (St)
+# plot((moments$R_moment_4) ~ moments$St, 
+#      main = "Fourth Moment vs. Particle Characteristic",
+#      xlab = "Particle Characteristic (St)",
+#      ylab = "Log-Transformed Fourth Moment",
+#      col = "red")
+# 
+# # Scatter plot of log-transformed fourth moment against particle characteristic (St)
+# plot(log(moments$R_moment_4) ~ moments$St, 
+#      main = "Log-Transformed Fourth Moment vs. Particle Characteristic",
+#      xlab = "Particle Characteristic (St)",
+#      ylab = "Log-Transformed Fourth Moment",
+#      col = "red")
+```
+
+## Methodology and Modeling:
+
+For each moment, we tried three different methods, specifically linear regression, ridge regression, and lasso regression. Because of lack of certainty on which predictors are significant out of the three (transformed) predictors and the interaction, we used lasso to do variable selection.
+
+For the second, third, and fourth models, `Fr=0.052` was chosen as the baseline level for `Fr` because it contains the most data points (36) compared to the other two levels, allowing a coefficient estimate with a smaller variance.
+
+To compare models, we used cross validation for linear regression, and then nested cross validation for ridge regression and lasso regression. Nested cross validation nests the hyperparameter optimization within the model selection procedure, providing a more accurate and robust evaluation of performance for models that require hyperparameter tuning like lasso and ridge regression. The lack of and inclusion of interaction effects was also considered based on the moment. Average RMSE across all folds was used as the performance metric.
+
+In fear of overfitting with such a small dataset, we chose to use the 1se lambda, the largest value of lambda such that the average RMSE is within 1 standard error of the minimum average cross validation RMSE, instead of the lambda that minimizes RMSE. In this way, we get a parsimonious model that performs well.
+
+### First Moment Model
+
+For the first moment, we treat Reynolds number (Re) and Froude's number (Fr) as continuous variables, even though they only have three possible values for extrapolation (even if it is with high uncertainty) for the mean of particle cluster volumes. We use a logarithmic transformation of Fr to normalize and properly scale the variables because we have two values below one, and the other is Infinity.
+
+```{r clean-setup-data-one, message = F, warning = F, echo=FALSE}
+
+moment_one_x <- model.matrix(log(R_moment_1)~log(Re)*log(Fr)+ log(St),moment_one)[,-1]
+moment_one_y <- log(moment_one$R_moment_1)
+
+
+#moment_one_x_test <- model.matrix(log(R_moment_1)~log(Re)*log(Fr)+ log(St),moments_test)[,-1]
+
+
+moment_one_grid <- 10^seq(10, -2, length = 100)
+
+set.seed(325)
+moment_one_train <- sample(1:nrow(moment_one_x), nrow(moment_one_x)/1.25)
+moment_one_test <- (-moment_one_train)
+#moment_one_test_set <- sample(1:nrow(moment_one_x_test), nrow(moment_one_x_test))
+moment_one_test_y <- moment_one_y[moment_one_test]
+```
+
+```{r, message = F, warning = F, echo=FALSE}
+momentonetest <- moments_test |>
+  mutate(
+    Fr = case_when(
+      Fr == Inf ~ 10000,
+      TRUE ~ Fr
+    ),
+
+  )
+
+moment_one_x_2 <- model.matrix(~log(Re)*log(Fr)+ log(St),momentonetest)[,-1]
+```
+
+```{r moment-1-model, message = F, warning = F, echo=FALSE}
+# momentonetest <- moments_test |>
+#   mutate(
+#     Fr = case_when(
+#       Fr == Inf ~ 10000,
+#       TRUE ~ Fr
+#     )
+#   )
+# 
+# momentonetest <- momentonetest|>
+#   mutate(
+#     'log(Fr)'= log(Fr),
+#     'log(Re)'=log(Re),
+#     'log(St)'=log(St),
+#     'log(Re):log(Fr)'=log(Re)*log(Fr)
+#   )
+# momentonetest <- momentonetest |>
+#   select(c('log(Fr)','log(Re)','log(St)','log(Re):log(Fr)'))
+# 
+# momentonetest <- model.matrix(momentonetest)
+
+
+moment_one_lasso.mod <- glmnet(moment_one_x[moment_one_train,], moment_one_y[moment_one_train], alpha = 1, lambda = moment_one_grid)
+#plot(moment_one_lasso.mod)
+
+set.seed(1)
+moment_one_cv.out <- cv.glmnet(moment_one_x[moment_one_train,], moment_one_y[moment_one_train], alpha = 1)
+#plot(moment_one_cv.out)
+moment_one_bestlam <- moment_one_cv.out$lambda.min
+#log(bestlam)
+
+moment_one_lasso.pred <- predict(moment_one_lasso.mod, s = moment_one_bestlam, newx = moment_one_x[moment_one_test,])
+
+#moment_one_x[moment_one_test,]
+
+moment_one_testing_pred <- predict(moment_one_lasso.mod, s = moment_one_bestlam, newx = moment_one_x_2)
+
+moment_one_testing_pred_scale <- exp(moment_one_testing_pred)
+
+moment_one_mse <- exp(mean((moment_one_lasso.pred - moment_one_test_y)^2))
+
+moment_one_out <- glmnet(moment_one_x, moment_one_y, alpha = 1, lambda = moment_one_grid)
+moment_one_lasso.coef <- predict(moment_one_out, type = "coefficients", s = moment_one_bestlam)[1:5,]
+m1lasssocoeff<- data.frame(moment_one_lasso.coef)
+
+moment_one_model <- lm(log(R_moment_1) ~ log(Re) + log(St) + log(Fr) + log(Fr)*log(Re), data = moment_one)
+
+# kable(
+#   list(
+#     m1lasssocoeff, tidy(moment_one_model)
+#   ), caption = "Lasso Results on Left, and Linear Model on Right", booktabs = TRUE, valign = 't'
+# )
+
+# par(mfrow = c(1,2))
+# plot(moment_one_model, which=c(2,1))
+
+m1_adj_r2 = summary(moment_one_model)$adj.r.squared
+m1_f_stat = summary(moment_one_model)$fstatistic[1]
+m1_numerator_DF = summary(moment_one_model)$fstatistic[2]
+m1_denominator_DF = summary(moment_one_model)$fstatistic[3]
+m1_f_stat_p_value = pf(summary(moment_one_model)$fstatistic[1], 
+                       summary(moment_one_model)$fstatistic[2],
+                       summary(moment_one_model)$fstatistic[3],
+                       lower.tail = FALSE)
+
+Metric <- c("5-Fold RMSE", "Adj. R2", "F-Statistic", "Numerator DF", "Denominator DF", "F-Statistic p-value")
+Moment_1_Value <- c(moment_one_mse, m1_adj_r2, m1_f_stat, m1_numerator_DF, m1_denominator_DF, 
+           m1_f_stat_p_value)
+#moment_one_metrics <- data.frame(Metric, Value)
+
+
+```
+
+From LASSO, we see that all the coefficients are significant, except log(Fr). However, because of the hierarchy principle, we decided to still include log(Fr) in the model for interpretability. We then ran a linear model after variable selection. While the linear model's coefficients are significant, we know it cannot do variable selection, so we will still assume log(Fr) is the only one that is not significant, and it is only present for interpretability. Otherwise, all other p values are under 0.05.
+
+```{r, message = F, warning = F, echo=FALSE}
+save_moment_1_model <- kable(
+  list(
+    m1lasssocoeff, tidy(moment_one_model)
+  ), caption = "Lasso Results on Left, and Linear Model on Right", booktabs = TRUE, valign = 't'
+)
+```
+
+$log(RMoment1) = 15.636633 + 0.196321log(St) - 3.943795log(Re) - 0.131090log(Fr) + 0.0251log(Fr)*log(Re)$
+
+For every 1% increase in St, the first moment is expected to increase by 0.196% on average while holding all other variables constant. For every 1% increase in Re, the first moment is expected to change by $-3.94\% + (0.0251*log(Fr))\%$ while holding all else constant. This term is more complicated because of the interaction term. However, all it means is that, if everything else is constant, then an increase in Re causes the first moment to fall, but that fall can be lessened by (or completely negated by) the value of Fr. This also makes sense because Re represents the turbulence around the system. As there is more turbulence in the system, fewer clusters will stick together, and thus cluster volumes will be lower. The gravity term (Fr) plays a role here because higher gravity might negate some of the turbulence's effect and hold clusters together, depending on how high the value is. For every 1% increase in Fr, the first moment is expected to change by $-0.131090\% + 0.251*log(Re)\%$ if all else is held constant. Here we see that, when everything else is constant an increase in Fr leads to a lower first moment, and this can be counteracted by the Reynolds number. The interpretation of the interaction term would be similar as above.
+
+We then looked into the assumptions. The residual plot for the most part seemed properly distributed across, with just slightly larger variances towards the latter values. The points on the Q-Q Residuals plot follow a straight line, indicating that the residuals are roughly normally distributed. We also don't see extreme outliers or high leverage points.
+
+### Second Moment Model
+
+```{r moment-2-model, echo=FALSE}
+set.seed(325)
+
+moment_two <- moments %>%
+  mutate(log_St = log(St),
+         Fr = as.factor(Fr),
+         # Fr = case_when(
+         #   Fr == Inf ~ 1000000000000,
+         #   TRUE ~ Fr),
+         # log_Fr = log(Fr), 
+         Red_Circle_Indicator = as.factor(ifelse(Re <= 100 & Fr == 0.052, 
+                                                 1, 0)),
+         log_moment_2 = log(R_moment_2))
+
+moment_two$Fr <- relevel(moment_two$Fr, ref = "0.052")
+
+moments_two_test <- moments_test %>%
+    mutate(log_St = log(St),
+           Fr = as.factor(Fr),
+           # Fr = case_when(
+           # Fr == Inf ~ 1000000000000,
+           # TRUE ~ Fr),
+           # log_Fr = log(Fr),
+           Red_Circle_Indicator = as.factor(ifelse(Re <= 100 & Fr == 0.052, 
+                                                 1, 0)))
+
+moments_two_test$Fr <- relevel(moments_two_test$Fr, ref = "0.052")
+
+moment_two_folded <- fold(
+  data = moment_two, k = 5) %>% 
+  arrange(.folds)
+
+CV1 <- cross_validate(
+  data = moment_two_folded,
+  formulas = "log_moment_2 ~ log_St + Fr + Re + Red_Circle_Indicator",
+  fold_cols = '.folds',
+  family = 'gaussian',
+  REML = FALSE
+)
+
+CV1 <- CV1 %>% 
+  select_metrics()
+
+CV_RMSE = CV1[[2]]
+  
+moment_two.linear_fit <- lm(log_moment_2 ~ log_St + Fr + Re + 
+                              Red_Circle_Indicator, data = moment_two)
+
+save_moment_2_model <- tidy(moment_two.linear_fit) |>
+  kable(digits = 4)
+
+m2_adj_r2 = summary(moment_two.linear_fit)$adj.r.squared
+m2_f_stat = summary(moment_two.linear_fit)$fstatistic[1]
+numerator_DF = summary(moment_two.linear_fit)$fstatistic[2]
+denominator_DF = summary(moment_two.linear_fit)$fstatistic[3]
+m2_f_stat_p_value = pf(summary(moment_two.linear_fit)$fstatistic[1], 
+                       summary(moment_two.linear_fit)$fstatistic[2],
+                       summary(moment_two.linear_fit)$fstatistic[3],
+                       lower.tail = FALSE)
+
+moment_two_train_pred <- predict(moment_two.linear_fit, 
+                                 newdata = moment_two)
+moment_two_test_pred <- predict(moment_two.linear_fit, 
+                                newdata = moments_two_test)
+
+moment_two_train_mse <- mean((moment_two_train_pred - moment_two$log_moment_2)^2)
+
+Metric <- c("5-Fold RMSE", "Adj. R2", "F-Statistic", "Numerator DF", "Denominator DF", "F-Statistic p-value")
+Moment_2_Value <- c(CV_RMSE, m2_adj_r2, m2_f_stat, numerator_DF, denominator_DF, 
+           m2_f_stat_p_value)
+#moment_two_metrics <- data.frame(Metric, Value)
+# 
+# moment_two_metrics |>
+#   kable(digits = 4,
+#         caption = "Moment 2 MLR Model")
+
+moment_2_pred_original_scale <- exp(moment_two_test_pred)
+```
+
+$log(M2) = 2.5540 + 0.9078*log(St) - 1.3585 * Fr_{0.3} - 0.9475 * Fr_{Inf} - 0.0176Re + 5.5442*RedCircle$
+
+All the predictors in this model are statistically significant, as seen by their p-value which is less than 0.05.
+
+The coefficient for `log_St` is 0.9078, and this means that for any 10% increase in `St`, we expect a 9% increase ($1.10^{0.9078}=1.09$) in `moment_2`, holding all else constant. This makes sense because a higher Stokes number means larger or denser particles which tend to contribute to increased turbulence variance. Both coefficients for `Fr=0.3,Inf` are negative, so we expect a 74.3% ($e^{-1.3585}=0.257$) and 61.2% ($e^{-0.9475}=0.388$) decrease in the geometric mean of `moment_2` when we go from `Fr=0.3` or `Fr=Inf` to `Fr=0.052`, respectively, holding all else constant. This implies when we go from cumulonimbus clouds (strong gravitational effects) to cumulus clouds (weaker gravitational effects), we see less turbulent fluid flow, resulting in a reduction in the variability. The coefficient for `Re` is -0.0176, and this means for a one-unit increase in Reynolds number, we expect to see about 1.7% decrease ($e^{-0.0176}=0.983$) in the geometric mean of `moment_2`, holding all else constant. This is surprising since a higher Reynolds number typically indicates more turbulent flow, but the model here says that the variance decreases correspondingly. This could be due to the limited size of the data.
+
+```{r, echo=FALSE}
+# par(mfrow = c(1,2))
+# plot(moment_two.linear_fit, which=c(2,1))
+```
+
+The residual and scale-location plot shows a slight tapering as the fitted values increase, but for the most part, the errors are mostly homoscedastic. Similarly, most of the Q-Q Residuals plot follow a straight line, indicating that the residuals are roughly normally distributed. The residuals vs leverage plot does show that there are a few high leverage and high residual points due to the very right skewed nature of the original data, but again for the most part, the points are clustered around the center thanks to the log transformation. The model fit for moment 2 is not perfect, but given the low RMSE and high $R^2$, it works decently and should be used with caution especially if the new data contains extreme or unusual values.
+
+### Third Moment
+
+```{r, echo=FALSE, warning=FALSE}
+set.seed(325)
+
+# set lambda range to test for cv
+m.3_lambda_seq = seq(0.001, 0.021, length = 100)
+
+# features in matrix
+m.3_encoded = as.matrix(
+  model.matrix(~ Fr_cat + Re_cat + log_St + Re_cat * Fr_cat - 1,
+                                    data = moment_three))
+# cv for finding best lambda
+m.3_cv <- cv.glmnet(x = m.3_encoded, y = moment_three$log_R_moment_3,
+                        alpha = 1, 
+                        lambda = m.3_lambda_seq, 
+                        nfolds = 5)
+# setting optimal lambda
+m.3_best_lambda = m.3_cv$lambda.1se
+# cv RMSE average
+m.3_lamind = which(m.3_cv$lambda == m.3_best_lambda)
+m.3_average_rmse = m.3_cv$cvm[m.3_lamind]
+
+# fit on entire training set with optimal lambda
+m.3_model = glmnet(x = m.3_encoded, y = moment_three$log_R_moment_3,
+                       alpha = 1,
+                       lambda = m.3_best_lambda)
+m.3_lm = lm(log_R_moment_3 ~ log_St + Fr_cat + Re_cat +Fr_cat*Re_cat, 
+            data = moment_three)
+# get coefficients for glm
+# coefficients <- coef(m.3_model, s = m.3_best_lambda)
+# temp_matrix = as(coefficients, "matrix")
+# m.3_coeffs <- data.frame(term = rownames(temp_matrix), estimate = temp_matrix)
+# kable(m.3_coeffs, col.names = c("term", "estimate"), row.names = FALSE)
+# get coefficients for lm
+save_moment_3_model <- tidy(m.3_lm) |>
+  kable(digits = 4)
+
+# cv for lm to approximate test error
+customRMSE <- function(data, lev = NULL, model = NULL) {
+  rmse <- sqrt(mean((data$obs - data$pred) ^ 2))
+  data.frame(RMSE = rmse)
+}
+
+# get test error estimate using cv
+m.3_train_control <- trainControl(method = "cv",
+                              number = 5)
+ 
+m.3_lmcv <- train(log_R_moment_3 ~ log_St + Fr_cat + Re_cat + Fr_cat * Re_cat, 
+                  data = moment_three, 
+                  method = "lm",
+                  trControl = m.3_train_control)
+# grabbing metrics
+m.3_lm_avgrmse = m.3_lmcv$results$RMSE
+m.3_adjr2 = summary(m.3_lm)$adj.r.squared
+m.3_fstat = summary(m.3_lm)$fstatistic[1]
+m.3_numdf = summary(m.3_lm)$fstatistic[2]
+m.3_dendf = summary(m.3_lm)$fstatistic[3]
+m.3_fstatp = pf(summary(m.3_lm)$fstatistic[1], 
+                       summary(m.3_lm)$fstatistic[2],
+                       summary(m.3_lm)$fstatistic[3],
+                       lower.tail = FALSE)
+
+moment_3_metrics <- data.frame(
+  Metric = c("5-Fold RMSE", "Adjusted R-squared", "F-statistic", "Numerator DF", "Denominator DF", "F-Statistic P-value"),
+  Value = c(
+    m.3_lm_avgrmse,
+    m.3_adjr2,
+    m.3_fstat,
+    m.3_numdf,
+    m.3_dendf,
+    m.3_fstatp
+  )
+)
+
+Moment_3_Value = c(
+    m.3_lm_avgrmse,
+    m.3_adjr2,
+    m.3_fstat,
+    m.3_numdf,
+    m.3_dendf,
+    m.3_fstatp
+  )
+```
+
+```{r moment-three-preds, echo = FALSE}
+moments_three_test = moments_test
+moments_three_test$log_St = log(moments_three_test$St)
+moments_three_test$Fr_cat = factor(moments_three_test$Fr)
+moments_three_test$Re_cat = factor(moments_three_test$Re)
+moments_three_test <- moments_three_test[, c("Fr_cat", "Re_cat", "log_St")]
+
+m3_preds = predict(m.3_lm, newdata = moments_three_test)
+moment_3_pred_original_scale = exp(m3_preds)
+```
+
+```{r, echo = FALSE}
+# m.3_pred <- predict(m.3_model, s = "lambda.1se", newx = m.3_encoded)
+# m.3_res <- moment_three$log_R_moment_3 - m.3_pred
+# 
+# # Residual vs. Fitted Values plot
+# plot(m.3_pred, m.3_res, xlab = "Fitted Values", ylab = "Residuals",
+#      main = "Residuals vs. Fitted Values")
+# print psuedo R^2
+```
+
+```{r, echo= FALSE}
+# plot(m.3_lm)
+```
+
+```{r, echo = FALSE, results = 'asis'}
+# cat("\\text{Deviance Ratio: }", m.3_model$dev.ratio, "\n")
+cat("\\text{Optimal Lambda: }", m.3_best_lambda)
+```
+
+$$
+\begin{aligned}
+log(M3)&=15.340+1.3831*log(St)-12.687*Fr_{0.3}-12.611*Fr_{Inf}\\ 
+&-11.233*Re_{224}-17.266*Re_{398}\\
+&+8.5632*Fr_{0.3}*Re_{224}+8.5185*Fr_{Inf}*Re_{224}+13.4058*Fr_{Inf}*Re_{398}
+\end{aligned}
+$$We performed cross validation on linear regression on its own, and then linear regression after using lasso regression to perform feature selection. With both methods, we considered the inclusion and exclusion of interaction effects.
+
+For lasso regression, we chose to use the 1se lambda to get a parsimonious model that performs well. Lasso regression seemed to remove only `Fr_catInf` and `Fr_cat0.3:Re_cat398`. Because this is difficult to interpret, we decided to keep all the variables and levels of interaction effects.
+
+Linear regression with interaction effects performed the best. This does make sense, as predictors on their own may not predict skewness well, but with interaction effects, we get a better idea of the real effects of our variables.
+
+Our coefficient estimates seem to be statistically significant under the alpha level of 0.05. This excludes one of the factor levels `Fr_cat0.3:Re_cat398`, which didn't have a coefficient due to singularity, meaning the column can be linearly predicted from the other columns. Holding all else constant, for every 10% increase in `St`, we expect a 0.1318 (`1.3831*log(1.1)`) increase in `log_R_moment_3`, and hence a 1.141 ($e^{0.1318}=1.09$) times higher `R_moment_3` value, on average. This suggests that a higher `St` tends to increase the third moment, or skewness of the velocity distribution. Considering interaction variables, it is difficult to interpret the effects of Fr and Re and as such won't be explicitly written out. For example, an observation with `Fr`=0.3 has $-12.687+8.563*Re_{224}$ difference in `log_R_moment_3` compared to the baseline observation's (`log(St)`=0, `Fr`=0.052, `Re`=90) `log_R_moment_3` value on average. Just considering `Fr` being either 0.3 or Inf, it has a large negative effect on `R_moment_3` compared to the baseline. But when `Re`=398 and `Fr`=Inf, `Fr` and the interaction effect have a positive effect on skewness compared to the baseline, which makes sense as higher values of `Fr` and `Re` tend to contribute to turbulence. `Re` is similar in that when it increases in value, it is predicted to decrease `R_moment_3` compared to the baseline. However, with `Fr`, the decrease in `R_moment_3` can potentially be much less.
+
+There are some outliers with particularly high residuals. Most Q-Q Residuals follow a straight line, so our residuals are approximately normally distributed. However, there may be some trend in the residuals, indicating heteroscedasticity, which can make our predictions biased. This could be due to many reasons, such as the size of the dataset, or the fact that we factorized `Re` and `Fr`, treating the levels equally.
+
+### Fourth Moment
+
+```{r model-moment-4, echo=FALSE, warning=FALSE, message=FALSE}
+moment_four <- moments %>%
+  mutate(log_St = log(St),
+         log_M4 = log(R_moment_4),
+         Fr = as.factor(Fr),
+         log_Re = log(Re))
+
+moment_four$Fr <- relevel(moment_four$Fr, ref = "0.052")
+
+moments_four_test <- moments_test %>%
+    mutate(log_St = log(St),
+         Fr = as.factor(Fr),
+         log_Re = log(Re))
+
+moments_four_test$Fr <- relevel(moments_four_test$Fr, ref = "0.052")
+
+moment_four_folded <- fold(
+  data = moment_four, k = 5) %>% 
+  arrange(.folds)
+
+CV1 <- cross_validate(
+  data = moment_four_folded,
+  formulas = "log_M4 ~ log_Re + Fr + log_Re*Fr + log_St",
+  fold_cols = '.folds',
+  family = 'gaussian',
+  REML = FALSE
+)
+
+CV1 <- CV1 %>% 
+  select_metrics()
+
+CV_RMSE = CV1[[2]]
+  
+moment_four.linear_fit <- lm(log_M4 ~ log_Re + Fr + 
+                               log_Re*Fr + log_St
+                              , data = moment_four)
+
+save_moment_4_model <- tidy(moment_four.linear_fit) |>
+  kable(digits = 4)
+
+m2_adj_r2 = summary(moment_four.linear_fit)$adj.r.squared
+m2_f_stat = summary(moment_four.linear_fit)$fstatistic[1]
+numerator_DF = summary(moment_four.linear_fit)$fstatistic[2]
+denominator_DF = summary(moment_four.linear_fit)$fstatistic[3]
+m2_f_stat_p_value = pf(summary(moment_four.linear_fit)$fstatistic[1], 
+                       summary(moment_four.linear_fit)$fstatistic[2],
+                       summary(moment_four.linear_fit)$fstatistic[3],
+                       lower.tail = FALSE)
+
+moment_four_train_pred <- predict(moment_four.linear_fit, 
+                                 newdata = moment_four)
+moment_four_test_pred <- predict(moment_four.linear_fit, 
+                                newdata = moments_four_test)
+
+moment_four_train_mse <- mean((moment_four_train_pred - moment_four$log_moment_2)^2)
+
+Metric <- c("5-Fold RMSE", "Adj. R2", "F-Statistic", "Numerator DF", "Denominator DF", "F-Statistic p-value")
+Moment_4_Value <- c(CV_RMSE, m2_adj_r2, m2_f_stat, numerator_DF, denominator_DF, 
+           m2_f_stat_p_value)
+#moment_four_metrics <- data.frame(Metric, Value)
+
+
+moment_4_pred_original_scale <- exp(moment_four_test_pred)
+
+# par(mfrow = c(1,2))
+# plot(moment_four.linear_fit, which=c(2,1))
+```
+
+$log(M4) = 94.2320 - 15.6260* log(Re) - 76.7147*Fr_{0.3} - 78.2808*Fr_{Inf} +1.7702*log(St)\\+12.9348*log(Re)*Fr_{0.3}+13.2817*log(Re)*Fr_{Inf}$
+
+94.230 is the unconditional expected mean of log of the fourth moment. The exponentiated value exp(94.230), 8.3863e+40, is the geometric mean of the fourth moment. For every 1% increase in Reynolds Number (Re), the fourth moment is predicted to increase by 15.6260%, holding all else constant. For every 1% increase in Particle Characteristic (St), the fourth moment is predicted to increase by 1.7702%, holding all else constant. When the Gravitational Acceleration (Fr) is 0.3, the log-transformed fourth moment is predicted to be 76.7147 less than when Fr is 0.052, holding all else constant. When the Gravitational Acceleration (Fr) is Inf, the log-transformed fourth moment is predicted to be 78.2808 less than when Fr is 0.052, holding all else constant. This makes sense since higher gravitational acceleration may induce more pronounced fluid movements and fluctuations, leading to lower log-transformed fourth moments. For every 1% increase in Reynolds Number (Re) when Fr is 0.3, the fourth moment is predicted to increase by 12.938%, holding all else constant. For every 1% increase in Reynolds Number (Re) when Fr is Inf, the fourth moment is predicted to increase by 13.2817%, holding all else constant. These interaction effects indicate that the combination of higher Reynolds Numbers with varying levels of gravitational forces contributes to a more pronounced increase in the fourth moment. This suggests that the interaction between these parameters amplifies the turbulence effects, resulting in the observed increase in the fourth moment.
+
+The residual plot shows a cluster of points towards the left two thirds of the plot, but there is not a jarring pattern. The Q-Q plot has initial curvature followed by a straight line, indicating that there is possible non-linearity or some skew as observed in the EDA.
+
+## Results:
+
+```{r results, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Assuming moment_two_metrics and moment_four_metrics are data frames or tables
+
+# Create plots
+
+# moment_one_metrics%>%
+#   kable(digits = 4, caption = "Moment 1 MLR Model")
+# 
+# moment_two_metrics %>%
+#   kable(digits = 4, caption = "Moment 2 MLR Model")
+# 
+# moment_3_metrics%>%
+#   kable(digits = 4, caption = "Moment 3 MLR Model")
+# 
+# moment_four_metrics %>%
+#   kable(digits = 4, caption = "Moment 4 MLR Model")
+
+data.frame(Metric, Moment_1_Value, Moment_2_Value, Moment_3_Value, Moment_4_Value) %>%
+   kable(digits = 4, caption = "Moment 1-4 MLR Models")
+  
+
+# knitr::kable(
+#   list(
+#     moment_one_metrics, moment_two_metrics, moment_3_metrics, moment_four_metrics), booktabs = TRUE, valign = 't', caption = "Moment 1-4 MLR Models (in order)")
+# Set up the plotting space
+# par(mfrow = c(2, 2))
+```
+
+The 5-Fold RMSE across all 4 models is very low. The adjusted R-squared of the models are all at least 92%, meaning that the majority of the variability in the data is accounted for by the model. The F-Statistic of each model has a p-value less than 0.05 so there is a relationship between each log transformed moment and its corresponding predictors. However, we have relatively high uncertainty in our models due to lack of data points, and since some of the predictors were turned into factors in our models, we can't easily extrapolate to values that are not in these levels. When the next batch of data is collected, they should be processed into these levels of the corresponding factor of the appropriate model.
+
+```{r test.csv-predictions, echo=FALSE}
+
+moments_test$R_moment_1 <- moment_one_testing_pred_scale
+moments_test$R_moment_2 <- moment_2_pred_original_scale
+moments_test$R_moment_3 <- moment_3_pred_original_scale
+moments_test$R_moment_4 <- moment_4_pred_original_scale
+
+write.csv(moments_test, file = "data-test.csv", row.names = FALSE)
+```
+
+## Conclusion:
+
+We investigated characteristics of turbulence data, applying log transformations to stabalize the variance and normalize the data for regression analysis. We identified significant relationships between the moments and the three parameters. The log transformation of moments improved the normality of the data, making it more suitable for statistical analysis. Distinct trends and relationships were observed between the log-transformed moments and Re, St, and Fr, suggesting complex interactions between these variables. Multicollinearity between the variables was low, allowing for the inclusion of all relevant parameters in the regression models. We used cross-validation and regularization methods to ensure the reliability of the models and mitigate overfitting concerns.
+
+All moments demonstrated varying degrees of sensitivity to the parameters, yet each moment demonstrated nonlinearity in their relationships with the parameters based on the data provided. Among the moments, we also observed similarities in terms of the significance of interaction effects, emphasizing the need to consider the combined influences of the parameters. There were clear differences in terms of the patterns observed within the data for the moments with some moments exhibiting clear trends in relation to what we know physically, while others exhibited deviations from general patterns.
+
+Overall, we observed the significance of interaction effects and nonlinear relationships in understanding the behavior of particle clustering in turbulence.
+
+\newpage
+
+## Appendix
+
+```{r, echo=FALSE}
+save_moment_1_model
+save_moment_2_model
+save_moment_3_model
+save_moment_4_model
+```
